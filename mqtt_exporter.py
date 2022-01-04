@@ -266,6 +266,7 @@ def finalize_labels(labels):
     """Keep '__value__', and '__topic__' but remove all other labels starting with '__'"""
     labels['value'] = labels['__value__']
     labels['topic'] = labels['__topic__']
+    labels['msg_topic'] = labels['__msg_topic__']
 
     return {k: v for k, v in labels.items() if not k.startswith('__')}
 
@@ -292,21 +293,51 @@ def _update_metrics(metrics, msg):
 
         labels = finalize_labels(labels)
 
-        derived_metric = metric.setdefault('derived_metric',
-                                           # Add derived metric for when the message was last received (timestamp in milliseconds)
-                                           {
-                                               'name': f"{metric['name']}_last_received",
-                                               'help': f"Last received message for '{metric['name']}'",
-                                               'type': 'gauge'
-                                           }
-                                           )
-        derived_labels = {'topic': metric['topic'],
-                          'value': int(round(time.time() * 1000))}
+        last_received_metric = metric.setdefault(
+            'last_received_metric',
+            # Add derived metric for when the message was last received (timestamp in milliseconds)
+            {
+                'name': f"{metric['name']}_last_received",
+                'help': f"Last received message for '{metric['name']}'",
+                'type': 'gauge'
+            }
+            )
 
-        _export_to_prometheus(metric['name'], metric, labels)
+        last_received_labels = {'__topic__': metric['topic'],
+                                '__msg_topic__': msg.topic,
+                                '__value__': int(round(time.time() * 1000))}
 
-        _export_to_prometheus(
-            derived_metric['name'], derived_metric, derived_labels)
+        if 'label_configs' in metric:
+            # If action 'keep' in label_configs fails, or 'drop' succeeds, the metric is not updated
+            if not _apply_label_config(last_received_labels, metric['label_configs']):
+                continue
+        last_received_labels = finalize_labels(last_received_labels)
+
+        result = _export_to_prometheus(metric['name'], metric, labels)
+
+        _export_to_prometheus(last_received_metric['name'], last_received_metric, last_received_labels)
+
+        result_metric = metric.setdefault(
+            'result_metric',
+            # Add derived metric for when the message was last received (timestamp in milliseconds)
+            {
+                'name': f"{metric['name']}_result",
+                'help': f"Result of last received message for '{metric['name']}'",
+                'type': 'gauge'
+            }
+            )
+
+        result_labels = {'__topic__': metric['topic'],
+                         '__msg_topic__': msg.topic,
+                         '__value__': result}
+
+        if 'label_configs' in metric:
+            # If action 'keep' in label_configs fails, or 'drop' succeeds, the metric is not updated
+            if not _apply_label_config(result_labels, metric['label_configs']):
+                continue
+        result_labels = finalize_labels(result_labels)
+        _export_to_prometheus(result_metric['name'], result_metric, result_labels)
+
 
 
 # noinspection PyUnusedLocal
@@ -360,7 +391,7 @@ def _export_to_prometheus(name, metric, labels):
         logging.error(
             f"Metric type: {metric['type']}, is not a valid metric type. Must be one of: {valid_types} - ingnoring"
         )
-        return
+        return 1  # Wrong metric type
 
     value = labels['value']
     del labels['value']
@@ -368,7 +399,6 @@ def _export_to_prometheus(name, metric, labels):
     sorted_labels = _get_sorted_tuple_list(labels)
     label_names, label_values = list(zip(*sorted_labels))
 
-    prometheus_metric = None
     if not metric.get('prometheus_metric') or not metric['prometheus_metric'].get('parent'):
         # parent metric not seen before, create metric
         additional_parameters = metric.get('parameters', {})
@@ -382,14 +412,18 @@ def _export_to_prometheus(name, metric, labels):
         prometheus_metric = metric['prometheus_metric']['parent']
     try:
         prometheus_metric.update(label_values, value)
+        result = 0  # All fine
     except ValueError as ve:
         logging.error(f"Value {value} is not compatible with metric {metric['name']} of type {metric['type']}")
         logging.exception('ve:')
+        result = 2  # Exception
 
     logging.debug(
         f"_export_to_prometheus metric ({metric['type']}): {name}{labels} updated with value: {value}")
     if logging.DEBUG >= logging.root.level:  # log test data only in debugging mode
         _log_test_data(metric, labels['topic'], value)
+
+    return result
 
 
 def _log_test_data(metric, topic, value):
